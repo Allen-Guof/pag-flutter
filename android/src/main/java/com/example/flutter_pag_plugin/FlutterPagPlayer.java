@@ -3,7 +3,6 @@ package com.example.flutter_pag_plugin;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
-import android.graphics.SurfaceTexture;
 import android.view.animation.LinearInterpolator;
 
 import org.libpag.PAGFile;
@@ -19,6 +18,7 @@ public class FlutterPagPlayer extends PAGPlayer {
 
     private final ValueAnimator animator = ValueAnimator.ofFloat(0.0F, 1.0F);
     private boolean isRelease;
+    private boolean surfaceAvailable;
     private long currentPlayTime = 0L;
     private double progress = 0;
     private double initProgress = 0;
@@ -29,6 +29,7 @@ public class FlutterPagPlayer extends PAGPlayer {
 
     public FlutterPagPlayer() {
         super();
+        surfaceAvailable = true;
         animator.setInterpolator(new LinearInterpolator());
         animator.addUpdateListener(animatorUpdateListener);
         animator.addListener(animatorListenerAdapter);
@@ -36,6 +37,10 @@ public class FlutterPagPlayer extends PAGPlayer {
 
     public boolean isRelease() {
         return isRelease;
+    }
+
+    public boolean isSurfaceAvailable() {
+        return valid();
     }
 
     public void init(PAGFile file, int repeatCount, double initProgress, MethodChannel channel, long textureId) {
@@ -60,7 +65,7 @@ public class FlutterPagPlayer extends PAGPlayer {
     }
 
     private boolean valid() {
-        return getSurface() != null;
+        return surfaceAvailable && getSurface() != null;
     }
 
 
@@ -93,23 +98,64 @@ public class FlutterPagPlayer extends PAGPlayer {
 
     @Override
     public void setSurface(PAGSurface pagSurface) {
+        if (WorkThreadExecutor.multiThread) {
+            synchronized (this) {
+                setSurfaceInternal(pagSurface);
+            }
+        } else {
+            setSurfaceInternal(pagSurface);
+        }
+    }
+
+    private void setSurfaceInternal(PAGSurface pagSurface) {
+        PAGSurface oldSurface = getSurface();
         super.setSurface(pagSurface);
+        surfaceAvailable = pagSurface != null;
+        if (oldSurface != null && oldSurface != pagSurface) {
+            oldSurface.release();
+        }
+    }
+
+    public void onSurfaceCleanup() {
+        if (WorkThreadExecutor.multiThread) {
+            synchronized (this) {
+                releaseCurrentSurface();
+                surfaceAvailable = false;
+            }
+        } else {
+            releaseCurrentSurface();
+            surfaceAvailable = false;
+        }
+    }
+
+    private void releaseCurrentSurface() {
+        PAGSurface currentSurface = getSurface();
+        super.setSurface(null);
+        if (currentSurface != null) {
+            currentSurface.release();
+        }
     }
 
 
     public void updateBufferSize() {
+        updateBufferSize(true);
+    }
+
+    public void updateBufferSize(boolean clearSurface) {
         if (WorkThreadExecutor.multiThread) {
             synchronized (this) {
-                PAGSurface surface = getSurface();
-                if (surface != null) {
-                    surface.updateSize();
-                    surface.clearAll();
-                }
+                updateBufferSizeInternal(clearSurface);
             }
         } else {
-            PAGSurface surface = getSurface();
-            if (surface != null) {
-                surface.updateSize();
+            updateBufferSizeInternal(clearSurface);
+        }
+    }
+
+    private void updateBufferSizeInternal(boolean clearSurface) {
+        PAGSurface surface = getSurface();
+        if (surface != null) {
+            surface.updateSize();
+            if (clearSurface) {
                 surface.clearAll();
             }
         }
@@ -147,6 +193,7 @@ public class FlutterPagPlayer extends PAGPlayer {
         animator.cancel();
         animator.removeAllUpdateListeners();
         animator.removeAllListeners();
+        surfaceAvailable = false;
         //此处如果放入子线程处理，会打印gl的错误日志，挪到主线程
         if (WorkThreadExecutor.multiThread) {
             synchronized (this) {
@@ -168,14 +215,20 @@ public class FlutterPagPlayer extends PAGPlayer {
         WorkThreadExecutor.getInstance().post(() -> {
             if (WorkThreadExecutor.multiThread) {
                 synchronized (this) {
+                    if (!valid()) {
+                        return;
+                    }
                     FlutterPagPlayer.super.flush();
                 }
             } else {
+                if (!valid()) {
+                    return;
+                }
                 FlutterPagPlayer.super.flush();
             }
 
         });
-        return true;
+        return valid();
 
 //        return super.flush();
     }
