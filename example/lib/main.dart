@@ -55,7 +55,7 @@ class _MyListHomeState extends State<MyHome> {
         ),
         Expanded(
             child: Visibility(
-              visible: visible,
+              visible: true,
               child: ListView.builder(
                   itemCount: 300,
                   // cacheExtent: 3000.0,
