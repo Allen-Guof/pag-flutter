@@ -351,8 +351,11 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
             bindSurface(currentId, entry, pagPlayer, composition.width(), composition.height());
         }
         WorkThreadExecutor.getInstance().post(() -> {
-            pagPlayer.init(composition, repeatCount, initProgress, channel, Long.parseLong(currentId));
+            // Clear stale content before the initial flush. Otherwise the async
+            // first-frame render can race with clearAll() and leave a blank view
+            // when autoPlay is disabled.
             pagPlayer.updateBufferSize();
+            pagPlayer.init(composition, repeatCount, initProgress, channel, Long.parseLong(currentId));
 
             handler.post(new Runnable() {
                 @Override
