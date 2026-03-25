@@ -1,10 +1,9 @@
 package com.example.flutter_pag_plugin;
 
 import android.content.Context;
-import android.graphics.SurfaceTexture;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.Surface;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -33,6 +32,8 @@ import kotlin.jvm.functions.Function1;
  * FlutterPagPlugin
  */
 public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
+    private static final String TAG = "FlutterPagPlugin";
+
     /// The MethodChannel that will the communication between Flutter and native Android
     ///
     /// This local reference serves to register the plugin with the Flutter Engine and unregister it
@@ -48,12 +49,9 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
     public static List<FlutterPagPlugin> pluginList = new ArrayList<FlutterPagPlugin>();
 
     private final HashMap<String, FlutterPagPlayer> layerMap = new HashMap<String, FlutterPagPlayer>();
-    // Keep the legacy SurfaceTexture path on Android.
-    // SurfaceProducer works on recent Flutter versions, but in this plugin it caused
-    // a visible blink after screen-off/screen-on because the backing Surface can be
-    // cleaned up and recreated during app resume.
-    private final HashMap<String, TextureRegistry.SurfaceTextureEntry> entryMap = new HashMap<>();
-    private final HashMap<String, Surface> surfaceMap = new HashMap<>();
+    // 使用 SurfaceProducer 以保持较新的 Flutter / Android 渲染链路性能。
+    // 通过 callback 处理 surface 生命周期，避免 app 息屏恢复后旧 surface 失效。
+    private final HashMap<String, TextureRegistry.SurfaceProducer> entryMap = new HashMap<>();
     //用于记录当前缓存可用的entry id
     private final LinkedList<String>  freeEntryPool = new LinkedList<>();
     //由于进入缓存池之前的entry清理是异步的，先放入此pool以避免超过缓存上限
@@ -320,17 +318,16 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
         final int viewId = call.argument(_argumentViewId);
         final FlutterPagPlayer pagPlayer;
         final String currentId;
-        final TextureRegistry.SurfaceTextureEntry entry;
+        final TextureRegistry.SurfaceProducer entry;
 
         if (freeEntryPool.isEmpty() || !useCache) {
             pagPlayer = new FlutterPagPlayer();
-            // createSurfaceTexture() keeps the rendering target stable across screen
-            // off/on in our PAG scenario, which avoids the resume flash seen with
-            // SurfaceProducer on Flutter 3.29.
-            entry = textureRegistry.createSurfaceTexture();
+            entry = textureRegistry.createSurfaceProducer();
             currentId = String.valueOf(entry.id());
             entryMap.put(String.valueOf(entry.id()), entry);
             layerMap.put(String.valueOf(entry.id()), pagPlayer);
+            attachSurfaceCallback(currentId, entry, pagPlayer);
+            Log.i(TAG, "initPag: create surface producer, textureId=" + currentId);
         } else {
             currentId = freeEntryPool.removeFirst();
             entry = entryMap.get(currentId);
@@ -344,6 +341,7 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
                 error(call, result, "-1102", "PagPlayer异常！", null);
                 return;
             }
+            Log.d(TAG, "initPag: reuse cached producer, textureId=" + currentId);
             notifyFrameReady(Long.parseLong(currentId), viewId);
         }
 
@@ -394,26 +392,48 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
 
     }
 
-    private void bindSurface(String entryId, TextureRegistry.SurfaceTextureEntry entry, FlutterPagPlayer pagPlayer, int width, int height) {
+    /**
+     * 绑定当前 producer 持有的 surface。
+     * SurfaceProducer 的 surface 在后台/前台切换后可能变化，因此不能缓存旧 surface。
+     */
+    private void bindSurface(String entryId, TextureRegistry.SurfaceProducer entry, FlutterPagPlayer pagPlayer, int width, int height) {
         if (entry == null || pagPlayer == null) {
             return;
         }
-        SurfaceTexture surfaceTexture = entry.surfaceTexture();
-        if (surfaceTexture == null) {
-            return;
-        }
         if (width > 0 && height > 0) {
-            surfaceTexture.setDefaultBufferSize(width, height);
+            entry.setSize(width, height);
         }
-        Surface surface = surfaceMap.get(entryId);
-        if (surface == null) {
-            surface = new Surface(surfaceTexture);
-            surfaceMap.put(entryId, surface);
-        }
+        android.view.Surface surface = entry.getSurface();
         if (!surface.isValid()) {
+            Log.w(TAG, "bindSurface: invalid surface, textureId=" + entryId);
             return;
         }
         pagPlayer.setSurface(PAGSurface.FromSurface(surface));
+        Log.d(TAG, "bindSurface: bound surface, textureId=" + entryId + ", size=" + entry.getWidth() + "x" + entry.getHeight());
+    }
+
+    /**
+     * 监听 surface 生命周期，在后台恢复时重新绑定并刷新当前帧，避免旧 surface 失效导致闪烁或空白。
+     */
+    private void attachSurfaceCallback(String entryId, TextureRegistry.SurfaceProducer entry, FlutterPagPlayer pagPlayer) {
+        entry.setCallback(new TextureRegistry.SurfaceProducer.Callback() {
+            @Override
+            public void onSurfaceAvailable() {
+                Log.i(TAG, "surface available, textureId=" + entryId);
+                WorkThreadExecutor.getInstance().post(() -> {
+                    bindSurface(entryId, entry, pagPlayer, entry.getWidth(), entry.getHeight());
+                    // 重新拿到 surface 后立即刷新当前帧，兼容暂停态和 autoPlay=false 的场景。
+                    pagPlayer.updateBufferSize(false);
+                    pagPlayer.flush();
+                });
+            }
+
+            @Override
+            public void onSurfaceCleanup() {
+                Log.i(TAG, "surface cleanup, textureId=" + entryId);
+                pagPlayer.onSurfaceCleanup();
+            }
+        });
     }
 
     private void notifyFrameReady(long textureId, int viewId) {
@@ -474,8 +494,7 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
         if (flutterPagPlayer == null) {
             return;
         }
-        // refresh is kept for Flutter-side compatibility, but with SurfaceTexture we
-        // only need to flush the current frame instead of rebinding a new Surface.
+        // refresh 仍保留给 Flutter 侧使用，这里只需要刷新当前帧即可。
         flutterPagPlayer.flush();
     }
 
@@ -523,13 +542,10 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
                 flutterPagPlayer.release();
             }
 
-            TextureRegistry.SurfaceTextureEntry entry = entryMap.remove(getTextureId(call));
+            TextureRegistry.SurfaceProducer entry = entryMap.remove(getTextureId(call));
             if (entry != null) {
+                entry.setCallback(null);
                 entry.release();
-            }
-            Surface surface = surfaceMap.remove(getTextureId(call));
-            if (surface != null) {
-                surface.release();
             }
         }
     }
@@ -572,11 +588,9 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
         for (FlutterPagPlayer pagPlayer : layerMap.values()) {
             pagPlayer.release();
         }
-        for (TextureRegistry.SurfaceTextureEntry entry : entryMap.values()) {
+        for (TextureRegistry.SurfaceProducer entry : entryMap.values()) {
+            entry.setCallback(null);
             entry.release();
-        }
-        for (Surface surface : surfaceMap.values()) {
-            surface.release();
         }
         freeEntryPool.clear();
         preFreeEntryPool.clear();
@@ -584,7 +598,6 @@ public class FlutterPagPlugin implements FlutterPlugin, MethodCallHandler {
         resultMap.clear();
         layerMap.clear();
         entryMap.clear();
-        surfaceMap.clear();
     }
 
     @Override
